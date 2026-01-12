@@ -1,0 +1,25 @@
+# Source (dist is compiled)
+src/
+tsconfig.json
+
+# Tests
+tests/
+
+# Documentation & assets (README.md is kept for npm)
+assets/
+docs/
+pages/
+*.mp4
+*.gif
+SAMPLE_TASKS.md
+vscode.md
+claude.md
+repomix-output.txt.xml
+.repomix/
+
+# Dev files
+.git/
+.gitignore
+.DS_Store
+node_modules/
+package-lock.json
