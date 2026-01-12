@@ -8,13 +8,12 @@ Connect Claude Desktop (or other MCP clients) to your Google Docs, Google Sheets
 
 ## Quick Start (npx)
 
-If you have Google OAuth credentials, you can run this server without cloning:
+**1. Get Google OAuth credentials** from [Google Cloud Console](https://console.cloud.google.com/):
+   - Create a project and enable Google Docs, Sheets, and Drive APIs
+   - Create OAuth 2.0 credentials (Desktop app type)
+   - Download the client ID and secret
 
-```bash
-npx @brainwavesio/google-docs-mcp
-```
-
-Or configure in Claude Desktop's `mcp_config.json`:
+**2. Configure Claude Desktop** (`mcp_config.json` or `.mcp.json`):
 
 ```json
 {
@@ -24,15 +23,16 @@ Or configure in Claude Desktop's `mcp_config.json`:
       "args": ["@brainwavesio/google-docs-mcp"],
       "env": {
         "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
-        "GOOGLE_CLIENT_SECRET": "your-client-secret",
-        "GOOGLE_REFRESH_TOKEN": "your-refresh-token"
+        "GOOGLE_CLIENT_SECRET": "your-client-secret"
       }
     }
   }
 }
 ```
 
-See [Environment Variable Authentication](#alternative-environment-variable-authentication-npx--containers) for details on getting a refresh token.
+**3. First run:** The server will automatically open your browser for Google authorization. After you approve, the token is saved to `~/.config/google-docs-mcp/token.json` for future use.
+
+That's it! No manual token copying required.
 
 ---
 
@@ -268,36 +268,28 @@ When `GOOGLE_IMPERSONATE_USER` is set, the server will impersonate that user whe
 
 ### Alternative: Environment Variable Authentication (npx / Containers)
 
-For running via `npx` or in containerized environments where you can't rely on local files, you can pass OAuth credentials entirely via environment variables.
+For running via `npx` or in containerized environments, pass OAuth credentials via environment variables.
 
-**Option A: Individual environment variables**
+**Required environment variables:**
 
 ```bash
-# Your OAuth client credentials (from credentials.json)
 export GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
 export GOOGLE_CLIENT_SECRET="your-client-secret"
+```
+
+**Optional:** If you already have a refresh token, you can skip the browser auth:
+
+```bash
 export GOOGLE_REFRESH_TOKEN="your-refresh-token"
 ```
 
-**Option B: Full credentials JSON as env var**
+**How authentication works:**
 
-```bash
-# The entire contents of credentials.json as a single env var
-export GOOGLE_CREDENTIALS_JSON='{"installed":{"client_id":"...","client_secret":"..."}}'
-export GOOGLE_REFRESH_TOKEN="your-refresh-token"
-```
+1. On first run, if no saved token exists, the server opens your browser for Google authorization
+2. After you approve, the token is saved to `~/.config/google-docs-mcp/token.json`
+3. Subsequent runs use the saved token automatically
 
-**Getting a refresh token:**
-
-If you have the client ID and secret but no refresh token yet, run the server with just those set:
-
-```bash
-GOOGLE_CLIENT_ID="..." GOOGLE_CLIENT_SECRET="..." npx @brainwavesio/google-docs-mcp
-```
-
-The server will prompt you through the OAuth flow and print the refresh token for you to save.
-
-**Claude Desktop config with env vars:**
+**Claude Desktop config:**
 
 ```json
 {
@@ -307,8 +299,7 @@ The server will prompt you through the OAuth flow and print the refresh token fo
       "args": ["@brainwavesio/google-docs-mcp"],
       "env": {
         "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
-        "GOOGLE_CLIENT_SECRET": "your-client-secret",
-        "GOOGLE_REFRESH_TOKEN": "your-refresh-token"
+        "GOOGLE_CLIENT_SECRET": "your-client-secret"
       }
     }
   }

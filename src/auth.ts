@@ -4,17 +4,21 @@ import { OAuth2Client } from 'google-auth-library';
 import { JWT } from 'google-auth-library';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import * as readline from 'readline/promises';
+import * as http from 'http';
+import * as os from 'os';
 import { fileURLToPath } from 'url';
+import open from 'open';
 
-// --- Calculate paths relative to this script file (ESM way) ---
+// --- Config directory for persistent token storage ---
+const CONFIG_DIR = path.join(os.homedir(), '.config', 'google-docs-mcp');
+const TOKEN_PATH = path.join(CONFIG_DIR, 'token.json');
+
+// --- Legacy paths (for backwards compatibility) ---
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRootDir = path.resolve(__dirname, '..');
-
-const TOKEN_PATH = path.join(projectRootDir, 'token.json');
-const CREDENTIALS_PATH = path.join(projectRootDir, 'credentials.json');
-// --- End of path calculation ---
+const LEGACY_TOKEN_PATH = path.join(projectRootDir, 'token.json');
+const LEGACY_CREDENTIALS_PATH = path.join(projectRootDir, 'credentials.json');
 
 const SCOPES = [
   'https://www.googleapis.com/auth/documents',
@@ -22,207 +26,341 @@ const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets'
 ];
 
-// --- Environment variable authentication ---
-// Supports OAuth credentials via env vars for containerized/npx usage:
-// - GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
-// - Or GOOGLE_CREDENTIALS_JSON (full credentials.json content as string)
-function hasEnvCredentials(): boolean {
-  return !!(
-    (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) ||
-    process.env.GOOGLE_CREDENTIALS_JSON
-  );
+// --- Ensure config directory exists ---
+async function ensureConfigDir(): Promise<void> {
+  try {
+    await fs.mkdir(CONFIG_DIR, { recursive: true });
+  } catch (err) {
+    // Directory might already exist
+  }
 }
 
-async function authorizeWithEnvCredentials(): Promise<OAuth2Client> {
-  let clientId: string;
-  let clientSecret: string;
-  let refreshToken: string | undefined;
+// --- Save token to config directory ---
+async function saveToken(credentials: {
+  client_id: string;
+  client_secret: string;
+  refresh_token: string;
+}): Promise<void> {
+  await ensureConfigDir();
+  const payload = JSON.stringify({
+    type: 'authorized_user',
+    client_id: credentials.client_id,
+    client_secret: credentials.client_secret,
+    refresh_token: credentials.refresh_token,
+  }, null, 2);
+  await fs.writeFile(TOKEN_PATH, payload);
+  console.error(`Token saved to ${TOKEN_PATH}`);
+}
 
-  if (process.env.GOOGLE_CREDENTIALS_JSON) {
-    // Parse the full credentials.json from env var
-    const keys = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-    const key = keys.installed || keys.web;
-    if (!key) {
-      throw new Error('GOOGLE_CREDENTIALS_JSON must contain "installed" or "web" key');
+// --- Load token from config directory or legacy location ---
+async function loadSavedToken(): Promise<{
+  client_id: string;
+  client_secret: string;
+  refresh_token: string;
+} | null> {
+  // Try new config location first
+  try {
+    const content = await fs.readFile(TOKEN_PATH, 'utf8');
+    const token = JSON.parse(content);
+    if (token.refresh_token) {
+      return token;
     }
-    clientId = key.client_id;
-    clientSecret = key.client_secret;
-    refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
-  } else {
-    clientId = process.env.GOOGLE_CLIENT_ID!;
-    clientSecret = process.env.GOOGLE_CLIENT_SECRET!;
-    refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  } catch (err) {
+    // Not found in config dir, try legacy location
   }
 
-  const client = new google.auth.OAuth2(clientId, clientSecret);
-
-  if (refreshToken) {
-    client.setCredentials({ refresh_token: refreshToken });
-    console.error('Using OAuth credentials from environment variables.');
-    return client;
+  // Try legacy token.json in project root
+  try {
+    const content = await fs.readFile(LEGACY_TOKEN_PATH, 'utf8');
+    const token = JSON.parse(content);
+    if (token.refresh_token) {
+      return token;
+    }
+  } catch (err) {
+    // Not found
   }
 
-  // No refresh token - need to do interactive auth flow
-  console.error('No GOOGLE_REFRESH_TOKEN found. Starting interactive OAuth flow...');
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  const authorizeUrl = client.generateAuthUrl({
-    access_type: 'offline',
-    scope: SCOPES.join(' '),
-  });
-
-  console.error('Authorize this app by visiting this url:', authorizeUrl);
-  const code = await rl.question('Enter the code from that page here: ');
-  rl.close();
-
-  const { tokens } = await client.getToken(code);
-  client.setCredentials(tokens);
-
-  if (tokens.refresh_token) {
-    console.error('\n=== SAVE THIS REFRESH TOKEN ===');
-    console.error('Add this to your environment:');
-    console.error(`GOOGLE_REFRESH_TOKEN=${tokens.refresh_token}`);
-    console.error('===============================\n');
-  }
-
-  console.error('Authentication successful!');
-  return client;
+  return null;
 }
-// --- End of environment variable authentication ---
+
+// --- Browser-based OAuth flow ---
+async function authenticateWithBrowser(
+  clientId: string,
+  clientSecret: string
+): Promise<OAuth2Client> {
+  return new Promise((resolve, reject) => {
+    // Find an available port
+    const server = http.createServer();
+
+    server.listen(0, '127.0.0.1', async () => {
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        reject(new Error('Failed to start local server'));
+        return;
+      }
+
+      const port = address.port;
+      const redirectUri = `http://127.0.0.1:${port}/callback`;
+
+      const client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+
+      const authorizeUrl = client.generateAuthUrl({
+        access_type: 'offline',
+        scope: SCOPES,
+        prompt: 'consent', // Force consent to ensure we get a refresh token
+      });
+
+      console.error('\n========================================');
+      console.error('Opening browser for Google authorization...');
+      console.error('If the browser does not open, visit this URL:');
+      console.error(authorizeUrl);
+      console.error('========================================\n');
+
+      // Handle the OAuth callback
+      server.on('request', async (req, res) => {
+        if (!req.url?.startsWith('/callback')) {
+          res.writeHead(404);
+          res.end('Not found');
+          return;
+        }
+
+        const url = new URL(req.url, `http://127.0.0.1:${port}`);
+        const code = url.searchParams.get('code');
+        const error = url.searchParams.get('error');
+
+        if (error) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1>Authorization Failed</h1>
+                <p>Error: ${error}</p>
+                <p>You can close this window.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(new Error(`Authorization failed: ${error}`));
+          return;
+        }
+
+        if (!code) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1>Authorization Failed</h1>
+                <p>No authorization code received.</p>
+                <p>You can close this window.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(new Error('No authorization code received'));
+          return;
+        }
+
+        try {
+          const { tokens } = await client.getToken(code);
+          client.setCredentials(tokens);
+
+          if (tokens.refresh_token) {
+            await saveToken({
+              client_id: clientId,
+              client_secret: clientSecret,
+              refresh_token: tokens.refresh_token,
+            });
+          }
+
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1>Authorization Successful!</h1>
+                <p>You can close this window and return to your application.</p>
+                <script>window.close();</script>
+              </body>
+            </html>
+          `);
+
+          server.close();
+          console.error('Authorization successful!');
+          resolve(client);
+        } catch (err) {
+          res.writeHead(500, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: system-ui; padding: 40px; text-align: center;">
+                <h1>Authorization Failed</h1>
+                <p>Failed to exchange code for tokens.</p>
+                <p>You can close this window.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(err);
+        }
+      });
+
+      // Set a timeout for the auth flow
+      const timeout = setTimeout(() => {
+        server.close();
+        reject(new Error('Authorization timed out after 5 minutes'));
+      }, 5 * 60 * 1000);
+
+      server.on('close', () => {
+        clearTimeout(timeout);
+      });
+
+      // Open the browser
+      try {
+        await open(authorizeUrl);
+      } catch (err) {
+        console.error('Failed to open browser automatically.');
+        console.error('Please open the URL above manually.');
+      }
+    });
+
+    server.on('error', (err) => {
+      reject(err);
+    });
+  });
+}
+
+// --- Get OAuth credentials from env vars or files ---
+function getClientCredentials(): { clientId: string; clientSecret: string } | null {
+  // Check environment variables first
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    return {
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    };
+  }
+
+  // Check for GOOGLE_CREDENTIALS_JSON env var
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    try {
+      const keys = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+      const key = keys.installed || keys.web;
+      if (key) {
+        return {
+          clientId: key.client_id,
+          clientSecret: key.client_secret,
+        };
+      }
+    } catch (err) {
+      console.error('Failed to parse GOOGLE_CREDENTIALS_JSON');
+    }
+  }
+
+  return null;
+}
+
+// --- Load credentials.json file (legacy support) ---
+async function loadCredentialsFile(): Promise<{ clientId: string; clientSecret: string } | null> {
+  try {
+    const content = await fs.readFile(LEGACY_CREDENTIALS_PATH, 'utf8');
+    const keys = JSON.parse(content);
+    const key = keys.installed || keys.web;
+    if (key) {
+      return {
+        clientId: key.client_id,
+        clientSecret: key.client_secret,
+      };
+    }
+  } catch (err) {
+    // File not found or invalid
+  }
+  return null;
+}
 
 // --- Service Account Authentication ---
 async function authorizeWithServiceAccount(): Promise<JWT> {
   const serviceAccountPath = process.env.SERVICE_ACCOUNT_PATH!;
   const impersonateUser = process.env.GOOGLE_IMPERSONATE_USER;
-  try {
-    const keyFileContent = await fs.readFile(serviceAccountPath, 'utf8');
-    const serviceAccountKey = JSON.parse(keyFileContent);
 
-    const auth = new JWT({
-      email: serviceAccountKey.client_email,
-      key: serviceAccountKey.private_key,
-      scopes: SCOPES,
-      subject: impersonateUser,
-    });
-    await auth.authorize();
-    if (impersonateUser) {
-      console.error(`Service Account authentication successful, impersonating: ${impersonateUser}`);
-    } else {
-      console.error('Service Account authentication successful!');
-    }
-    return auth;
-  } catch (error: any) {
-    if (error.code === 'ENOENT') {
-      console.error(`FATAL: Service account key file not found at path: ${serviceAccountPath}`);
-      throw new Error(`Service account key file not found. Please check the path in SERVICE_ACCOUNT_PATH.`);
-    }
-    console.error('FATAL: Error loading or authorizing the service account key:', error.message);
-    throw new Error('Failed to authorize using the service account. Ensure the key file is valid and the path is correct.');
-  }
-}
-// --- End of Service Account Authentication ---
+  const keyFileContent = await fs.readFile(serviceAccountPath, 'utf8');
+  const serviceAccountKey = JSON.parse(keyFileContent);
 
-// --- File-based OAuth (original behavior) ---
-async function loadSavedCredentialsIfExist(): Promise<OAuth2Client | null> {
-  try {
-    const content = await fs.readFile(TOKEN_PATH);
-    const credentials = JSON.parse(content.toString());
-    const { client_secret, client_id, redirect_uris } = await loadClientSecrets();
-    const client = new google.auth.OAuth2(client_id, client_secret, redirect_uris?.[0]);
-    client.setCredentials(credentials);
-    return client;
-  } catch (err) {
-    return null;
-  }
-}
-
-async function loadClientSecrets() {
-  const content = await fs.readFile(CREDENTIALS_PATH);
-  const keys = JSON.parse(content.toString());
-  const key = keys.installed || keys.web;
-  if (!key) throw new Error("Could not find client secrets in credentials.json.");
-  return {
-    client_id: key.client_id,
-    client_secret: key.client_secret,
-    redirect_uris: key.redirect_uris || ['http://localhost:3000/'],
-    client_type: keys.web ? 'web' : 'installed'
-  };
-}
-
-async function saveCredentials(client: OAuth2Client): Promise<void> {
-  const { client_secret, client_id } = await loadClientSecrets();
-  const payload = JSON.stringify({
-    type: 'authorized_user',
-    client_id: client_id,
-    client_secret: client_secret,
-    refresh_token: client.credentials.refresh_token,
-  });
-  await fs.writeFile(TOKEN_PATH, payload);
-  console.error('Token stored to', TOKEN_PATH);
-}
-
-async function authenticate(): Promise<OAuth2Client> {
-  const { client_secret, client_id, redirect_uris, client_type } = await loadClientSecrets();
-  const redirectUri = client_type === 'web' ? redirect_uris[0] : 'urn:ietf:wg:oauth:2.0:oob';
-  console.error(`DEBUG: Using redirect URI: ${redirectUri}`);
-  console.error(`DEBUG: Client type: ${client_type}`);
-  const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
-
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-  const authorizeUrl = oAuth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: SCOPES.join(' '),
+  const auth = new JWT({
+    email: serviceAccountKey.client_email,
+    key: serviceAccountKey.private_key,
+    scopes: SCOPES,
+    subject: impersonateUser,
   });
 
-  console.error('DEBUG: Generated auth URL:', authorizeUrl);
-  console.error('Authorize this app by visiting this url:', authorizeUrl);
-  const code = await rl.question('Enter the code from that page here: ');
-  rl.close();
+  await auth.authorize();
 
-  try {
-    const { tokens } = await oAuth2Client.getToken(code);
-    oAuth2Client.setCredentials(tokens);
-    if (tokens.refresh_token) {
-      await saveCredentials(oAuth2Client);
-    } else {
-      console.error("Did not receive refresh token. Token might expire.");
-    }
-    console.error('Authentication successful!');
-    return oAuth2Client;
-  } catch (err) {
-    console.error('Error retrieving access token', err);
-    throw new Error('Authentication failed');
+  if (impersonateUser) {
+    console.error(`Service Account authentication successful, impersonating: ${impersonateUser}`);
+  } else {
+    console.error('Service Account authentication successful!');
   }
+
+  return auth;
 }
-// --- End of file-based OAuth ---
 
 // --- Main exported function ---
 // Priority order:
 // 1. Service account (SERVICE_ACCOUNT_PATH)
-// 2. Environment variables (GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET + GOOGLE_REFRESH_TOKEN, or GOOGLE_CREDENTIALS_JSON)
-// 3. File-based OAuth (credentials.json + token.json)
+// 2. Saved token + env credentials
+// 3. Env var refresh token (GOOGLE_REFRESH_TOKEN)
+// 4. Browser-based OAuth flow
+// 5. Legacy file-based credentials
 export async function authorize(): Promise<OAuth2Client | JWT> {
   // 1. Check for service account
   if (process.env.SERVICE_ACCOUNT_PATH) {
-    console.error('Service account path detected. Attempting service account authentication...');
+    console.error('Service account path detected. Using service account authentication...');
     return authorizeWithServiceAccount();
   }
 
-  // 2. Check for env var credentials
-  if (hasEnvCredentials()) {
-    console.error('Environment variable credentials detected. Using env-based authentication...');
-    return authorizeWithEnvCredentials();
-  }
+  // Get client credentials from env or files
+  let credentials = getClientCredentials();
 
-  // 3. Fall back to file-based OAuth
-  console.error('Using file-based OAuth flow...');
-  let client = await loadSavedCredentialsIfExist();
-  if (client) {
-    console.error('Using saved credentials.');
+  // 2. Check for saved token
+  const savedToken = await loadSavedToken();
+
+  if (savedToken) {
+    // Use saved token - prefer env credentials if available, otherwise use token's credentials
+    const clientId = credentials?.clientId || savedToken.client_id;
+    const clientSecret = credentials?.clientSecret || savedToken.client_secret;
+
+    const client = new google.auth.OAuth2(clientId, clientSecret);
+    client.setCredentials({ refresh_token: savedToken.refresh_token });
+    console.error('Using saved credentials from ~/.config/google-docs-mcp/');
     return client;
   }
-  console.error('Starting authentication flow...');
-  client = await authenticate();
-  return client;
+
+  // 3. Check for refresh token in env var
+  if (credentials && process.env.GOOGLE_REFRESH_TOKEN) {
+    const client = new google.auth.OAuth2(credentials.clientId, credentials.clientSecret);
+    client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+
+    // Save this token for future use
+    await saveToken({
+      client_id: credentials.clientId,
+      client_secret: credentials.clientSecret,
+      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+    });
+
+    console.error('Using refresh token from environment variable.');
+    return client;
+  }
+
+  // 4. Try to load credentials from file if not in env
+  if (!credentials) {
+    credentials = await loadCredentialsFile();
+  }
+
+  // 5. If we have client credentials, do browser-based OAuth
+  if (credentials) {
+    console.error('No saved token found. Starting browser-based authentication...');
+    return authenticateWithBrowser(credentials.clientId, credentials.clientSecret);
+  }
+
+  // No credentials available
+  throw new Error(
+    'No Google credentials found. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables, ' +
+    'or place a credentials.json file in the project directory.'
+  );
 }
