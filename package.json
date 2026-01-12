@@ -1,16 +1,31 @@
 {
-  "name": "mcp-googledocs-server",
+  "name": "@brainwavesio/google-docs-mcp",
   "version": "1.0.0",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "google-docs-mcp": "./index.js"
+  },
   "scripts": {
     "test": "node --test tests/",
-    "build": "tsc"
+    "build": "tsc",
+    "prepare": "tsc"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
+  "keywords": [
+    "mcp",
+    "google-docs",
+    "google-sheets",
+    "google-drive",
+    "claude",
+    "model-context-protocol"
+  ],
+  "author": "BrainWaves (fork of a-bonus/google-docs-mcp)",
+  "license": "MIT",
+  "description": "MCP server for Google Docs, Sheets, and Drive integration with Claude and other MCP clients",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brainwavesio/google-docs-mcp.git"
+  },
   "dependencies": {
     "fastmcp": "^3.24.0",
     "google-auth-library": "^9.15.1",
